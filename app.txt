@@ -1,0 +1,337 @@
+import streamlit as st
+from utils.prompts import load_prompts
+from utils.blob_functions import get_blob_content, write_to_blob
+from utils.azure_openai import run_prompt
+import pandas as pd
+# from PyPDF2 import PdfReader
+from bs4 import BeautifulSoup
+import os
+import json
+import io
+from azure.storage.blob import BlobServiceClient
+# --------------------------
+# --- Azure Blob Storage Setup ---
+
+# --- Get HTML Blob ---
+container_client = blob_service_client.get_container_client(container_name)
+html_blobs = [blob.name for blob in container_client.list_blobs() if blob.name.endswith(".html")]
+
+if not html_blobs:
+    raise FileNotFoundError("No .html files found in container.")
+
+blob_name = html_blobs[0]
+blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+
+blob_bytes = blob_client.download_blob().readall()
+html_content = blob_bytes.decode("utf-8")
+
+# --- Parse HTML and Extract <div class="page"> ---
+soup = BeautifulSoup(html_content, "html.parser")
+divs = soup.find_all("div", class_="page")
+divs_html = ''.join(str(div) for div in divs)
+
+# --- Reparse only page divs ---
+soup = BeautifulSoup(divs_html, "html.parser")
+pages = soup.find_all("div", class_="page")
+
+pages_data = []
+
+for idx, page in enumerate(pages):
+    page_id = page.get("id")
+    try:
+        page_no = int(page_id) if page_id and page_id.isdigit() else idx + 1
+    except:
+        page_no = idx + 1
+    
+    text = page.get_text(separator=" ", strip=True)
+
+    tags_list = []
+    for tag in page.find_all():
+        if tag.name and tag.name.startswith("ix:"):
+            tag_key = tag.get("name")
+            tag_value = tag.get_text(strip=True)
+            if tag_key:
+                tag_entry = {
+                    "name": tag_key,
+                    "value": tag_value
+                }
+                if tag.has_attr("unitref"):
+                    tag_entry["unitRef"] = tag["unitref"]
+                if tag.has_attr("decimals"):
+                    tag_entry["decimals"] = tag["decimals"]
+
+                dimensions = {}
+                for attr_key, attr_val in tag.attrs.items():
+                    if "dimension" in attr_key.lower():
+                        dimensions[attr_key] = attr_val
+                if dimensions:
+                    tag_entry["dimension"] = dimensions
+
+                tags_list.append(tag_entry)
+
+    if tags_list:
+        pages_data.append({
+            "page_no": page_no,
+            "raw_text": text,
+            "tags": tags_list
+        })
+
+# --- Print JSON ---
+result_json = json.dumps(pages_data, indent=2)
+
+
+# --------------------------
+
+system_prompt = '''
+  You are a validation assistant for iXBRL financial reports. You will be provided with two files:
+    1. An Excel workbook containing metadata across three sheets.
+    2. An iXBRL HTML file (`raw_text`) representing the tagged financial statements.
+
+  Your job is to extract data from the Excel file, analyze each sheet row-by-row in conjunction with the HTML, and validate against the defined rules. You will return your results as a structured JSON object.
+
+  Perform the following four validation tasks:
+
+  --------------------------------------------------
+  TASK 1: Taxonomy Information Validation
+  --------------------------------------------------
+  Sheet: **Filing Information**
+
+  ### Step 1: Determine Entity Type
+  - UK: registration number is 8 digits (e.g., 12345678)
+  - Ireland: registration number is 6 digits (e.g., 456789)
+  - Check the registration number from either the Excel row and the HTML tags.(it should be the taxanomy, not the registration number)
+  - Also check the tax rate from the HTML `raw_text` (e.g., "25%" or "12.5%")
+  - If both registration number and tax rate agree, decide entity type.
+  - If mismatch or not found, flag the issue.
+
+  ### Step 2: Determine Taxonomy Type
+  - Find the taxonomy type in either:
+    - Excel row where `"Filer Name"` is `"Taxonomy Name"`
+    - HTML text that mentions: "FRS 101", "FRS 102", or "Full IFRS", Check in Director’s responsibility statement OR audit report OR accounting policies section
+  - Return the taxonomy type.
+
+  ### Step 3: Taxonomy Version
+  - Ensure taxonomy version is explicitly "2023" (e.g., “FRS 102 (Irish Extension 2023)”).
+  - If missing or not 2023, flag the discrepancy.
+
+  Output Format:
+  {
+    "entity_type": "UK" | "Irish" | "Unknown",
+    "taxonomy_name": "<value from Excel>",
+    "tax_rate_found": "<value from HTML>",
+    "tax_rate_valid": true | false,
+    "inferred_from_tax_rate": "UK" | "Irish" | "Unknown",
+    "taxonomy_type": "FRS 101" | "FRS 102" | "Full IFRS",
+    "taxonomy_version": "2023" | "<other>",
+    "taxonomy_version_valid": true | false,
+    "taxonomy_valid": true | false,
+    "issues": ["No flag" | "Flag: <reason>"]
+  }
+
+  --------------------------------------------------
+  TASK 2: Reporting Period Date Validation
+  --------------------------------------------------
+  Sheet: **Filing Details**
+
+  - Parse the HTML `raw_text` section titled **"STATEMENT OF CHANGES IN EQUITY"**
+  - Extract:
+    • Current Period Start and End Dates
+    • Prior Period Start and End Dates
+    • Opening Date of Prior Period (midnight before prior start)
+    • End Dates for both periods
+  - Validate dates from Excel:
+    • Ensure all relevant Excel dates fall within expected reporting ranges
+    • Check for logical consistency (e.g., prior year should not end after current year)
+  - Flag any mismatches or invalid entries.
+
+  Output Format:
+  [
+    {
+      "excel_date": "<value>",
+      "context": "<column/row information>",
+      "valid": true | false,
+      "issue": "No flag" | "Flag: <reason>"
+    },
+    ...
+  ]
+
+  --------------------------------------------------
+  TASK 3: Comment Review and Quality
+  --------------------------------------------------
+  Sheet: **Free Selection Comments**
+
+  For each row:
+  - Perform **Spelling and Grammar Checks** on 'Comment Text':
+    • Highlight incorrect spellings and grammar issues with suggested corrections.
+  - Perform **Context Validation**:
+    • Compare 'Comment Text' with the corresponding 'Document Value'.
+    • Assess whether the comment is appropriate for the tagged element based on HTML context.
+  
+  Output Format:
+  [
+    {
+      "comment_text": "<original comment>",
+      "document_value": "<associated value>",
+      "spelling_errors": "Yes" | "No",
+      "grammar_errors": "Yes" | "No",
+      "context_match": "Yes" | "No",
+      "issues": ["None" | "<list of identified issues>"]
+    },
+    ...
+  ]
+
+  --------------------------------------------------
+  TASK 4: Concept Label, Tag Value, Accuracy & Unit Validation
+  --------------------------------------------------
+  Sheet: **Filing Details**
+
+  ### 1. Concept Label
+  - Match the Excel "Concept Label" to the `name` field in the HTML.
+  - Accept label synonyms (e.g., readable label vs `core:OperatingProfitLoss`) only if semantically aligned.
+
+  ### 2. Tag Value
+  - Compare Excel's "Tag Value" with the HTML’s `value` field.
+  - Normalize values (remove commas, trim spaces).
+  - Allow rounding tolerance only if declared accuracy supports it.
+
+  ### 3. Numerical Accuracy
+  - Validate accuracy formatting:
+    • Whole numbers → Accuracy = 1
+    • Decimals (e.g., 44641245.49) → Accuracy = 0.01
+    • Percentages (e.g., 1.00%) → Accuracy = 0.01
+  - If accuracy is blank, infer based on format.
+  - Do not flag blanks unless they cause semantic mismatch.
+  - Flag overly loose or wrong accuracy usage.
+
+  ### 4. Unit Validation
+  - Check Excel "Unit" column against `unitRef` in HTML.
+  - Validate unit context (e.g., currency vs percentage vs shares).
+  - Examples of valid units: GBP, EUR, %, shares, pure.
+  - Flag inconsistency between unit and value type (e.g., EUR vs GBP for same entity).
+
+  Output Format:
+  [
+    {
+      "Concept Label": "correct" | "incorrect",
+      "Document Value": "correct" | "incorrect",
+      "Tag Value": "correct" | "incorrect",
+      "Unit": "correct" | "incorrect",
+      "Accuracy": "correct" | "incorrect",
+      "Review Result": "Correctly tagged." | "Tagging needs correction due to <reason>"
+    },
+    ...
+  ]
+
+  --------------------------------------------------
+  Final Combined Output
+  --------------------------------------------------
+  Return a **single JSON object** structured as follows:
+
+  {
+    "taxonomy_check": { ... },
+    "date_validation": [ ... ],
+    "comment_review": [ ... ],
+    "concept_validation": [ ... ]
+  }
+
+  Rules:
+  - Do not hallucinate or assume values.
+  - Use only the provided Excel data and HTML raw text.
+  - Be clear, structured, and detailed in all validations.
+'''
+
+user_prompt ='''
+You will be provided with two inputs: \n\n1. Excel Content (as structured JSON), which includes data from the following sheets: \n   - 'Filing Information'\n   - 'Filing Details'\n   - 'Free Selection Comments'\n\n2. HTML Content (as raw iXBRL HTML string).\n\nYour task is to use this information and validate the Excel entries row by row using the HTML context. Perform the following validations as per system instructions:\n\n- Task 1: Taxonomy Validation (from 'Filing Information')\n- Task 2: Reporting Period Date Validation (from 'Filing Details')\n- Task 3: Comment Review (from 'Free Selection Comments')\n- Task 4: Concept Label, Tag Value, Accuracy, and Unit Validation (from 'Filing Details')\n\nReturn all findings in a single structured JSON object as specified."
+'''
+st.set_page_config(page_title="iXBRL Review Assistant", layout="wide")
+st.title("📄 iXBRL Review Assistant")
+
+# Upload a file
+uploaded_file = st.file_uploader("Upload a file (.xlsx, .csv, .pdf, .html)", type=["xlsx", "csv", "pdf", "html", "txt"])
+
+if uploaded_file:
+    blob_name = uploaded_file.name
+    ext = os.path.splitext(blob_name)[1].lower()
+
+    try:
+        # Read blob content
+        if ext == '.csv':
+            content = pd.read_csv(uploaded_file)
+            st.write("CSV Preview:", content.head())
+
+        elif ext == '.xlsx':
+            xls = pd.ExcelFile(uploaded_file)
+
+            df_info = pd.read_excel(xls, sheet_name='Filing Information').dropna(how='all')
+            df_comments = pd.read_excel(xls, sheet_name='Free Selection Comments')[['Document Value', 'Comment Text']].dropna(how='all')
+            df_filing = pd.read_excel(xls, sheet_name='Filing Details')[['Concept Label', 'Document Value', 'Tag Value']].dropna(how='all')
+
+            final_output = {
+                "Filing Information": df_info.to_dict(orient='records'),
+                "Free Selection Comments": df_comments.to_dict(orient='records'),
+                "Filing Details": df_filing.to_dict(orient='records')
+            }
+            # content = final_output
+# Combine HTML data here:
+            html_data = json.loads(result_json)  # result_json is your global/external extracted HTML JSON string
+            final_output["HTML Pages"] = html_data
+
+            content = final_output 
+            # content
+            st.write("excel ka output", content)
+
+            st.subheader("✅ Excel Sheets Preview")
+            st.write("📄 Filing Information", df_info.head())
+            st.write("💬 Comments", df_comments.head())
+            st.write("🧾 Filing Details", df_filing.head())
+
+        elif ext == '.pdf':
+            reader = PdfReader(uploaded_file)
+            content = "\n".join(page.extract_text() for page in reader.pages)
+            st.text_area("📄 PDF Content", content[:2000])
+
+        elif ext in ['.html', '.htm']:
+            soup = BeautifulSoup(uploaded_file.read().decode('utf-8'), 'html.parser')
+            content = soup.get_text()
+            st.text_area("🧾 HTML Text", content[:2000])
+
+        else:
+            content = uploaded_file.read().decode('utf-8')
+            st.text_area("📝 Raw Text", content[:2000])
+
+        # Load prompts
+        # prompts = load_prompts()
+        # system_prompt = prompts.get("system_prompt", "")
+        # user_prompt = prompts.get("user_prompt", "")
+        system_prompt = system_prompt
+        user_prompt = user_prompt
+
+        # Format prompt
+        if isinstance(content, dict):
+            full_user_prompt = user_prompt + "\n\n"
+            for sheet, rows in content.items():
+                full_user_prompt += f"### Sheet: {sheet}\n"
+                full_user_prompt += json.dumps(rows[:10], indent=2) + "\n\n"
+        else:
+            full_user_prompt = user_prompt + content
+        st.write("THIS IS PASSED TO LLM", full_user_prompt)
+        # Run prompt
+        if st.button("🔍 Review with OpenAI"):
+            with st.spinner("Processing with Azure OpenAI..."):
+                result = run_prompt(system_prompt, full_user_prompt)
+
+                # Clean result
+                if result.startswith('```json'):
+                    result = result.replace('```json', '').replace('```', '').strip()
+
+                st.success("✅ Response from OpenAI")
+                st.json(json.loads(result))
+
+                # Optionally write to blob
+                if st.checkbox("Upload result to gold container"):
+                    sourcefile = os.path.splitext(blob_name)[0]
+                    write_to_blob("gold", f"{sourcefile}-output.json", result.encode("utf-8"))
+                    st.success("🎉 Output uploaded to gold container")
+
+    except Exception as e:
+        st.error(f"❌ Error: {str(e)}")
