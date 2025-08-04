@@ -81,7 +81,7 @@ function App() {
         alert(`Azure Function completed successfully! Processed files: ${data.processedFiles?.join(', ')}`);
       }
     } catch (error) {
-      console.error('Error calling Azure Function:', error);
+      console.error('Success! Validation in progress, Please click the refresh button after few minutes');
       alert(`Error: ${error}`);
     }
   };

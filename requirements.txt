@@ -54,3 +54,4 @@ PyPDF2           # For reading PDF files
 beautifulsoup4   # For parsing HTML
 lxml             # Optional but makes BeautifulSoup faster and more robust
 azure-storage-blob  # For accessing Azure Blob Storage
+python-Levenshtein

@@ -13,16 +13,17 @@
   },
   "routes": [
     {
-      "route": "/authentication/*",
+      "route": "/.auth/*",
+      "allowedRoles": ["anonymous"]
+    },
+    {
+      "route": "/login",
+      "redirect": "/.auth/login/aad",
       "allowedRoles": ["anonymous"]
     },
     {
       "route": "/logout",
       "redirect": "/.auth/logout",
-      "statusCode": 302
-    },
-    {
-      "route": "/.auth/*",
       "allowedRoles": ["anonymous"]
     },
     {
@@ -32,8 +33,8 @@
   ],
   "responseOverrides": {
     "401": {
-      "statusCode": 302,
-      "redirect": "/.auth/login/aad?post_login_redirect_uri=/dashboard"
+      "redirect": "/login",
+      "statusCode": 302
     }
   }
 }

@@ -5,11 +5,16 @@ import json
 import io
 import os
 import pandas as pd
+import re
 from utils.prompts import load_prompts
 from utils.blob_functions import get_blob_content, write_to_blob, list_blobs
 from utils.azure_openai import run_prompt
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
+import Levenshtein
+from typing import Tuple
+
+
  
 # Define batch size (adjust based on LLM token limits)
 BATCH_SIZE = 10
@@ -158,8 +163,7 @@ def validate_taxonomy_with_llm(taxonomy_data):
     taxonomy_prompt = prompts["taxonomy"]
  
     try:
-        logging.info(f"YE HAI TAXANOMY DATA:  {taxonomy_data}")
-
+        # logging.info(f"YE HAI TAXANOMY DATA:  {taxonomy_data}")
         user_prompt = taxonomy_prompt.format(data=json.dumps(taxonomy_data, indent=2))
         response = run_prompt(system_prompt, user_prompt).strip()
         logging.info(f'TAXANOMY:{response}')
@@ -243,7 +247,7 @@ def concept_label_filter(excel_rows, matched_taxonomy_blob_name):
         logging.info(f"✅ {len(matched_rows)} rows matched from {matched_taxonomy_blob_name}")
         # logging.info(f"{matched_rows} : MATCHED LABEL")
 
-        logging.warning(f"⚠️ {len(unmatched_rows)} rows did not match in Presentation sheet")
+        logging.warning(f"⚠️ {len(unmatched_rows)} rows did not match in Presentation sheet from {matched_taxonomy_blob_name}")
         # logging.warning(f"⚠️ {unmatched_rows} : UNMATCHED LABEL")
 
         return matched_rows, unmatched_rows
@@ -251,8 +255,27 @@ def concept_label_filter(excel_rows, matched_taxonomy_blob_name):
     except Exception as e:
         logging.error(f"Failed concept_label_filter for {matched_taxonomy_blob_name}: {str(e)}")
         return excel_rows, []
+    
+def normalize_taxonomy_name(taxonomy_name: str) -> Tuple[str, str]:
+    taxonomy_name = taxonomy_name.lower()
 
- 
+    if "frs 101" in taxonomy_name:
+        taxonomy_type = "frs-101"
+    elif "frs 102" in taxonomy_name:
+        taxonomy_type = "frs-102"
+    elif "ifrs" in taxonomy_name:
+        taxonomy_type = "ifrs"
+    else:
+        taxonomy_type = taxonomy_name
+
+    if any(keyword in taxonomy_name for keyword in ["ireland", "irish"]):
+        jurisdiction = "ireland"
+    elif any(keyword in taxonomy_name for keyword in ["uk", "frc", "united kingdom"]):
+        jurisdiction = "uk"
+    else:
+        jurisdiction = taxonomy_name
+
+    return taxonomy_type, jurisdiction
 
 def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Python HTTP trigger function processed a request.')
@@ -267,21 +290,6 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
     req_body = req.get_json()
     selected_blobs = req_body.get("blobs", None)
     input_dates = req_body.get("selectedDates", [])
- 
-    # input_dates = req_body.get("input_dates", [])  # Expecting UI to send dates here
-    # input_dates = {
-    # "end_date_current": "2023-12-31",
-    # "duration_current": {
-    #     "start": "2023-01-01",
-    #     "end": "2023-12-31"
-    # },
-    # "end_date_prior": "2022-12-31",
-    # "duration_prior": {
-    #     "start": "2022-01-01",
-    #     "end": "2022-12-31"
-    # },
-    # "opening_date_prior": "2021-12-31"
-    # }
 
     if not selected_blobs:
         return func.HttpResponse(
@@ -305,52 +313,6 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
             res = future.result()
             blob_results.append(res)
 
-                # 🔍 Find the matching taxonomy file for this blob
-            matched_taxonomy_file = None
-            if res["taxonomy_data"]:
-                for row in res["taxonomy_data"]:
-                    taxonomy_name = row.get("Taxonomy") or row.get("Taxonomy Name") or row.get("Name")
-                    if not taxonomy_name:
-                        continue
-
-                    lower = taxonomy_name.lower()
-                    if "frs 101" in lower:
-                        base = "frs101"
-                    elif "frs 102" in lower:
-                        base = "frs102"
-                    elif "ifrs" in lower:
-                        base = "ifrs"
-                    else:
-                        base = "unknown"
-
-                    if "irish" in lower:
-                        region = "irish"
-                    elif "uk" in lower:
-                        region = "uk"
-                    else:
-                        region = "unknown"
-
-                    for blob in taxonomy_blobs_list:
-                        file_name = blob.name.lower()
-                        if region == "uk" and "ireland" not in file_name and base in file_name:
-                            matched_taxonomy_file = blob.name
-                            logging.info(f"✅ Matched taxonomy '{taxonomy_name}' → '{blob.name}'")
-                            break
-                        if region == "irish" and "ireland" in file_name and base in file_name:
-                            matched_taxonomy_file = blob.name
-                            logging.info(f"✅ Matched taxonomy '{taxonomy_name}' → '{blob.name}'")
-                            break
-
-                    if matched_taxonomy_file:
-                        break
-
-            res["matched_taxonomy_file"] = matched_taxonomy_file
-
-
-            if res["error"]:
-                errors.append(res["error"])
-            all_periods.extend(res.get("unique_periods", []))
-
             # LLM input prep (leave as is)
             if res["taxonomy_data"]:
                 taxonomy_data_to_validate.extend(res["taxonomy_data"])
@@ -359,9 +321,25 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
                     "source": "html_statement_of_compliance",
                     "content": res["statement_of_compliance_text"]
                 })
- 
- 
+            
+            if res["error"]:
+                errors.append(res["error"])
+            all_periods.extend(res.get("unique_periods", []))
+
         # first: validate taxonomy first
+        # logging.warning(f"Taxonomy Name Extracted: {next((entry['SWL'] for entry in taxonomy_data_to_validate if entry.get('Filer Name') == 'Taxonomy Name'), None)}")
+        logging.warning(f"Taxonomy Data to Validate: {taxonomy_data_to_validate}")
+        
+# extract taxonomy name dynamically regardless of structure
+        taxonomy_name = None
+        for row in taxonomy_data_to_validate:
+            if row.get("Filer Name") == "Taxonomy Name":
+                # Get the first value that is NOT 'Filer Name'
+                taxonomy_name = next((v for k, v in row.items() if k != "Filer Name"), None)
+                break
+
+        logging.info(f"📘 Taxonomy Name Extracted: {taxonomy_name}")
+
         if taxonomy_data_to_validate:
             taxonomy_result = validate_taxonomy_with_llm(taxonomy_data_to_validate)
             validated_data.append({"taxonomy_validation": taxonomy_result})
@@ -379,23 +357,56 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
         # for res in blob_results:
         #     if res["excel_rows"]:
         #         validated_data.extend(validate_with_llm(res["excel_rows"]))
+
+        # Dynamically match taxonomy_name to available files in taxanomy container
+
+        matched_taxonomy_file = None
+
+        if taxonomy_name:
+            taxonomy_type, jurisdiction = normalize_taxonomy_name(taxonomy_name)
+            logging.info(f"🔍 Normalized taxonomy_type: {taxonomy_type}, jurisdiction: {jurisdiction}")
+
+            def is_valid_candidate(file):
+                fname = file.name.lower()
+                if jurisdiction.lower() in ["irish", "ireland"]:
+                    return "ireland-frs-2023" in fname
+                elif jurisdiction.lower() in ["uk", "frc", "united kingdom"]:
+                    return "frc-2023" in fname
+                return False
+
+            valid_candidates = [b for b in taxonomy_blobs_list if is_valid_candidate(b)]
+            best_score = 0
+
+            for blob in valid_candidates:
+                filename = blob.name.lower()
+                score = 5 if taxonomy_type in filename else 0
+                score += 5 - min(Levenshtein.distance(taxonomy_type, filename), 5)  # Fuzzy match on taxonomy_type
+
+                if score > best_score:
+                    best_score = score
+                    matched_taxonomy_file = blob.name
+
+
+        logging.warning(f"DHOOM MACHALE: {matched_taxonomy_file}")
+
         
         for res in blob_results:
             if res["excel_rows"]:
-                matched_file = "FRC-2023-v1.0.1-FRS-101.xlsx"
+                # matched_file = "FRC-2023-v1.0.1-FRS-101.xlsx"
+                matched_file = matched_taxonomy_file
                 if matched_file:
                     filtered_rows, unmatched_rows = concept_label_filter(res["excel_rows"], matched_file)
-                    logging.info(f"✅LLM KO MATCHED CONCEPT LABELS BHEJRE --> {len(filtered_rows)}")
+                    # logging.info(f"MATCHED TAXANOMY FILE -----> {matched_taxonomy_file}")
+                    logging.info(f"LLM KO MATCHED CONCEPT LABELS BHEJRE --> {len(filtered_rows)}")
                     validated_data.extend(validate_with_llm(filtered_rows))
 
-                    # Optional: log or save unmatched rows
                     if unmatched_rows:
-                        logging.warning(f"⚠️ {len(unmatched_rows)} unmatched Concept Labels in {res['blob_name']}")
+                        # logging.warning(f"⚠️ {len(unmatched_rows)} unmatched Concept Labels in {res['blob_name']}")
                                         # Add unmatched concept labels with validation message
                         for row in unmatched_rows:
                             validated_data.append({
                                 "Concept Label": row.get("Concept Label"),
-                                "validation_errors": ["Stating the Concept Label is not present in the taxonomy"]
+                                "validation_errors": ["Concept Label is not present in the matched taxonomy"]
                             })
 
                 else:
