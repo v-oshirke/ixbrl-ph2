@@ -13,8 +13,6 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 import Levenshtein
 from typing import Tuple
-
-
  
 # Define batch size (adjust based on LLM token limits)
 BATCH_SIZE = 10
@@ -49,7 +47,7 @@ def process_blob(blob):
             df_filing_details = pd.read_excel(xls, sheet_name='Filing Details')
  
             # Extract relevant columns for LLM validation
-            df = df_filing_details[['Line Item Description', 'Concept Label', 'Comment Text','Dimensions']].dropna(how='all')
+            df = df_filing_details[['Line Item Description', 'Concept Label', 'Comment Text','Dimensions','Tag Value']].dropna(how='all')
  
             # Extract unique 'Period' values
             if 'Period' in df_filing_details.columns:
@@ -73,17 +71,22 @@ def process_blob(blob):
                     logging.warning(f"'Filing Information' sheet is empty in blob {blob_name}")
             else:
                 logging.warning(f"'Filing Information' sheet missing in blob {blob_name}")
-       
+
         elif ext == '.html':
             try:
                 soup = BeautifulSoup(blob_bytes.decode('utf-8', errors='ignore'), 'html.parser')
- 
+
+                full_text = []
+
+                # --------------------------
+                # Statement of Compliance
+                # --------------------------
                 start_tag = None
                 for p in soup.find_all("p"):
                     if "STATEMENT OF COMPLIANCE" in p.get_text(strip=True).upper():
                         start_tag = p
                         break
- 
+
                 content = []
                 if start_tag:
                     current = start_tag
@@ -94,12 +97,65 @@ def process_blob(blob):
                         if text:
                             content.append(text)
                         current = current.find_next_sibling("p")
- 
-                result["statement_of_compliance_text"] = "\n".join(content)
- 
+
+                if content:
+                    full_text.append("=== STATEMENT OF COMPLIANCE ===")
+                    full_text.extend(content)
+
+                # --------------------------
+                # NOTES TO THE FINANCIAL STATEMENTS (all occurrences)
+                # --------------------------
+                notes_occurrences = []
+                for p in soup.find_all("p"):
+                    if "NOTES TO THE FINANCIAL STATEMENTS" in p.get_text(strip=True).upper():
+                        notes_occurrences.append(p)
+
+                for idx, start_tag in enumerate(notes_occurrences, start=1):
+                    notes_content = []
+                    current = start_tag
+                    while current:
+                        text = current.get_text(strip=True)
+                        if any(stop in text.upper() for stop in ["ACCOUNTING POLICIES", "DIRECTORS", "INDEPENDENT AUDITOR"]):
+                            break
+                        if text:
+                            notes_content.append(text)
+                        current = current.find_next_sibling("p")
+                    if notes_content:
+                        full_text.append(f"=== NOTES TO FS occurrence {idx} ===")
+                        full_text.extend(notes_content)
+
+                # --------------------------
+                # Factors affecting tax charge for the year
+                # --------------------------
+                tax_section = []
+                start_tag = None
+                for p in soup.find_all("p"):
+                    if "FACTORS AFFECTING TAX" in p.get_text(strip=True).upper():
+                        start_tag = p
+                        break
+
+                if start_tag:
+                    current = start_tag
+                    while current:
+                        text = current.get_text(strip=True)
+                        if any(stop in text.upper() for stop in ["NOTES TO THE", "DIRECTORS", "INDEPENDENT AUDITOR"]):
+                            break
+                        if text:
+                            tax_section.append(text)
+                        current = current.find_next_sibling("p")
+
+                if tax_section:
+                    full_text.append("=== FACTORS AFFECTING TAX ===")
+                    full_text.extend(tax_section)
+
+                # --------------------------
+                # Save everything in one field
+                # --------------------------
+                result["statement_of_compliance_text"] = "\n".join(full_text)
+
             except Exception as e:
                 result["error"] = f"Error extracting HTML content from {blob_name}: {str(e)}"
- 
+                
     except Exception as e:
         result["error"] = f"Error processing blob {blob_name}: {str(e)}"
  
@@ -163,8 +219,10 @@ def validate_taxonomy_with_llm(taxonomy_data):
     taxonomy_prompt = prompts["taxonomy"]
  
     try:
-        # logging.info(f"YE HAI TAXANOMY DATA:  {taxonomy_data}")
+        # logging.info(f"TAXANOMY DATA:  {taxonomy_data}")
         user_prompt = taxonomy_prompt.format(data=json.dumps(taxonomy_data, indent=2))
+        logging.info(f'HTML --> {user_prompt}')
+
         response = run_prompt(system_prompt, user_prompt).strip()
         logging.info(f'TAXANOMY:{response}')
  
@@ -340,6 +398,8 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
 
         logging.info(f"📘 Taxonomy Name Extracted: {taxonomy_name}")
 
+        logging.info(f"HTML DATA ----> {taxonomy_data_to_validate}")
+
         if taxonomy_data_to_validate:
             taxonomy_result = validate_taxonomy_with_llm(taxonomy_data_to_validate)
             validated_data.append({"taxonomy_validation": taxonomy_result})
@@ -406,7 +466,7 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
                         for row in unmatched_rows:
                             validated_data.append({
                                 "Concept Label": row.get("Concept Label"),
-                                "validation_errors": ["Concept Label is not present in the matched taxonomy"]
+                                "validation_result": [{ "status": "FLAGGED FOR REVIEW","reason": "Concept Label not found in matched taxonomy file"}]
                             })
 
                 else:

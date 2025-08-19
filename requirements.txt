@@ -55,3 +55,13 @@ beautifulsoup4   # For parsing HTML
 lxml             # Optional but makes BeautifulSoup faster and more robust
 azure-storage-blob  # For accessing Azure Blob Storage
 python-Levenshtein
+azure-functions
+azure-identity
+requests
+requests-toolbelt
+azure-storage-blob
+pandas
+beautifulsoup4
+python-Levenshtein
+openpyxl
+openai

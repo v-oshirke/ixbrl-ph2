@@ -290,9 +290,9 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
             logging.warning("No input dates provided for period validation.")
  
         # Third: now validate Excel rows after taxonomy is validated
-        # for res in blob_results:
-        #     if res["excel_rows"]:
-        #         validated_data.extend(validate_with_llm(res["excel_rows"]))
+        for res in blob_results:
+            if res["excel_rows"]:
+                validated_data.extend(validate_with_llm(res["excel_rows"]))
  
  
     # Validate JSON
