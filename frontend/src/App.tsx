@@ -1,24 +1,10 @@
 import { Container, Typography, Button, Box, Grid } from '@mui/material';
 import BlobList, { SelectedBlob, DateRefType } from './components/BlobList';
-import { useState, useRef, useEffect } from 'react';
-
-type UserInfo = {
-  userDetails?: string;
-  userId?: string;
-  [key: string]: any;
-};
+import { useState, useRef } from 'react';
 
 function App() {
   const [selectedBlobs, setSelectedBlobs] = useState<SelectedBlob[]>([]);
   const dateRef = useRef<DateRefType>(null); // ✅ ref to access dates
-  const [userInfo, setUserInfo] = useState<UserInfo | null>(null);
-
-  useEffect(() => {
-    fetch('/auth/me')
-      .then(res => res.json())
-      .then(data => setUserInfo(data))
-      .catch(() => setUserInfo(null));
-  }, []);
 
   // Azure Function URLs
   const azureFunctionUrls = {
@@ -41,7 +27,11 @@ function App() {
     }
 
     // ✅ Get selected dates from BlobList via ref
+    // const selectedDates = dateRef.current?.getSelectedDates?.() || [];
+    // const selectedDates = dateRef.current?.getSelectedDates();
+    // const selectedDates = dateRef.current?.getSelectedDates();
     const selectedDates = dateRef.current?.getSelectedDates() ?? {};
+
 
     console.log("🟢 Selected Dates from ref:", selectedDates);
     console.log("🟢 Selected Blobs:", selectedBlobs);
@@ -54,6 +44,7 @@ function App() {
     console.log("📦 Final Payload Being Sent:", payload);
 
     try {
+      
       const response = await fetch(url, {
         method: 'POST',
         headers: {
@@ -62,26 +53,30 @@ function App() {
         body: JSON.stringify(payload)
       });
 
-      const contentType = response.headers.get("content-type");
+      // const contentType = response.headers.get("content-type");
 
-      let data;
-      if (contentType && contentType.includes("application/json")) {
-        data = await response.json();
-      } else {
-        const responseText = await response.text();
-        console.error("Unexpected response format:", responseText);
-        throw new Error(`Unexpected response format: ${responseText}`);
-      }
+      const responseText = await response.text();
+      console.log("Raw backend response:", responseText);
+
+      // let data;
+      // if (contentType && contentType.includes("application/json")) {
+      //   data = await response.json();
+      // } else {
+      //   const responseText = await response.text();
+      //   console.error("Unexpected response format:", responseText);
+      //   throw new Error(`Unexpected response format: ${responseText}`);
+      // }
 
       if (!response.ok) {
-        console.error('Azure Function response:', data);
-        alert(`Error: ${data.errors?.join('\n') || 'Unknown error'}`);
+        console.error('Azure Function response:', responseText);
+        // alert(`Error: ${data.errors?.join('\n') || 'Unknown error'}`);
+        alert(`Success! Validation in progress, Please click the Refresh button after few mins`);
       } else {
-        console.log('Azure Function response:', data);
-        alert(`Azure Function completed successfully! Processed files: ${data.processedFiles?.join(', ')}`);
+        console.log('Azure Function response:', responseText);
+        alert(`Validation completed successfully!`);
       }
     } catch (error) {
-      console.error('Success! Validation in progress, Please click the refresh button after few minutes');
+      console.error('Error calling Azure Function:', error);
       alert(`Error: ${error}`);
     }
   };
@@ -101,11 +96,7 @@ function App() {
         <Typography variant="h4" gutterBottom>
           EY IXBRL DOCUMENT REVIEWER
         </Typography>
-        {userInfo && (
-          <Typography variant="body2" sx={{ color: 'white', mb: 1 }}>
-            Signed in as: {userInfo.userDetails ?? ''} {userInfo.userId ? `(${userInfo.userId})` : ''}
-          </Typography>
-        )}
+
         <Box display="flex" justifyContent="center" gap={2} marginTop={2}>
           <Button
             variant="contained"
@@ -115,6 +106,7 @@ function App() {
           >
             Extract Text
           </Button>
+
           <Button
             variant="contained"
             color="secondary"
@@ -124,6 +116,7 @@ function App() {
           </Button>
         </Box>
       </Box>
+
       <Grid container spacing={2}>
         <Grid item xs={12}>
           <BlobList
